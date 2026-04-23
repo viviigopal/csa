@@ -1,6 +1,6 @@
 # =============================================================================
-# WEEK 3 — AI CUSTOMER SUPPORT COPILOT (GRADIO + GROQ) - STABLE & FIXED
-# Fixed ChromaDB '_id' error + llama-3.1-8b-instant
+# WEEK 3 — AI CUSTOMER SUPPORT COPILOT (GRADIO + GROQ) - FULLY FIXED
+# Robust ChromaDB handling + Stable Groq model
 # =============================================================================
 
 import warnings
@@ -40,7 +40,7 @@ def load_artifacts():
     chroma_client = chromadb.PersistentClient(path=f'{ARTIFACTS_PATH}/chroma_db')
     collection = chroma_client.get_collection("clinc150_kb")
 
-    print("✅ All artifacts loaded successfully!")
+    print("✅ Artifacts loaded!")
     return tfidf, clf, embedder, faiss_index, collection, knowledge_base, chunk_index
 
 tfidf, clf, embedder, faiss_index, collection, knowledge_base, chunk_index = load_artifacts()
@@ -80,34 +80,31 @@ def retrieve_documents(query: str, predicted_intent: str, confidence: float, top
         filter_mode = "no_filter"
 
     try:
-        result = collection.query(
-            query_embeddings=q_emb.tolist(),
-            n_results=top_k,
-            where=where
-        ) if where else collection.query(
-            query_embeddings=q_emb.tolist(),
-            n_results=top_k
-        )
-    except Exception:
+        if where:
+            result = collection.query(query_embeddings=q_emb.tolist(), n_results=top_k, where=where)
+        else:
+            result = collection.query(query_embeddings=q_emb.tolist(), n_results=top_k)
+    except:
         result = collection.query(query_embeddings=q_emb.tolist(), n_results=top_k)
         filter_mode = "fallback"
 
+    # === ROBUST RESULT PARSING (Fixed '_id' error) ===
     docs = []
-    # FIXED: Safe access to ChromaDB results
     ids = result.get('ids', [[]])[0]
     documents = result.get('documents', [[]])[0]
     metadatas = result.get('metadatas', [[]])[0]
     distances = result.get('distances', [[]])[0]
 
     for i in range(len(ids)):
-        meta = metadatas[i] if i < len(metadatas) else {}
-        doc_text = documents[i] if i < len(documents) else ""
-        
+        meta = metadatas[i] if isinstance(metadatas, list) and i < len(metadatas) else {}
+        doc_text = documents[i] if isinstance(documents, list) and i < len(documents) else ""
+        dist = distances[i] if isinstance(distances, list) and i < len(distances) else 0.0
+
         docs.append({
-            "title": meta.get("title", "Unknown"),
+            "title": meta.get("title", "Document"),
             "domain": meta.get("domain", "General"),
             "resolution": knowledge_base.get(meta.get("intent"), {}).get("resolution", doc_text),
-            "retrieval_score": float(1 - distances[i]) if i < len(distances) else 0.0,
+            "retrieval_score": float(1 - dist),
             "filter_mode": filter_mode
         })
     return docs, filter_mode
@@ -117,9 +114,9 @@ def generate_with_groq(query: str, retrieved_docs: List[Dict], groq_key: str):
         fallback = retrieved_docs[0]['resolution'] if retrieved_docs else "Please contact customer support."
         return fallback, False
 
-    system_prompt = """You are a professional bank customer support copilot.
-Give concise, empathetic, and accurate replies (3-5 sentences).
-Use ONLY the information from the documents below."""
+    system_prompt = """You are a helpful bank customer support assistant.
+Give short, clear, empathetic replies (3-5 sentences max).
+Use only the information given in the documents."""
 
     context = "\n\n".join([f"[{d['title']} — {d['domain']}]\n{d['resolution']}" for d in retrieved_docs])
 
@@ -137,9 +134,9 @@ Use ONLY the information from the documents below."""
         return completion.choices[0].message.content.strip(), True
     except Exception as e:
         fallback = retrieved_docs[0]['resolution'] if retrieved_docs else "Our team will help you."
-        return f"⚠️ Groq Error: {str(e)[:80]}...\n\nFallback: {fallback}", False
+        return f"⚠️ Groq Error: {str(e)[:100]}\n\nFallback: {fallback}", False
 
-# ========================== GRADIO APP ==========================
+# ========================== GRADIO ==========================
 def process_query(query, groq_key, top_k, use_filter):
     if not query.strip():
         return "Please enter a query", None, None, None, None, []
@@ -165,21 +162,19 @@ def process_query(query, groq_key, top_k, use_filter):
     return status, result, retrieved_docs, llm_response, [], []
 
 def approve(current_result, edited_response, history):
-    if not current_result:
-        return history, "Nothing to approve"
+    if not current_result: return history, "Nothing to approve"
     entry = {**current_result, "final_response": edited_response, "status": "approved", "timestamp": time.strftime("%H:%M:%S")}
     history.append(entry)
     return history, "✅ Approved!"
 
 def reject(current_result, history):
-    if not current_result:
-        return history, "Nothing to reject"
+    if not current_result: return history, "Nothing to reject"
     entry = {**current_result, "final_response": "", "status": "rejected", "timestamp": time.strftime("%H:%M:%S")}
     history.append(entry)
     return history, "❌ Rejected"
 
 with gr.Blocks(title="AI Support Copilot", theme=gr.themes.Soft()) as demo:
-    gr.Markdown("# 🤖 AI Customer Support Copilot\n**Stable Version • llama-3.1-8b-instant**")
+    gr.Markdown("# 🤖 AI Customer Support Copilot\n**Stable & Fixed Version**")
 
     with gr.Tab("💬 Copilot"):
         groq_key = gr.Textbox(label="Groq API Key", type="password", placeholder="gsk_...")
@@ -188,7 +183,7 @@ with gr.Blocks(title="AI Support Copilot", theme=gr.themes.Soft()) as demo:
             query_input = gr.Textbox(label="Customer Query", lines=3, placeholder="My payment failed but money was deducted...")
             with gr.Column():
                 top_k = gr.Slider(1, 5, value=3, label="Top-K Documents")
-                use_filter = gr.Checkbox(True, label="Use Intent Filter")
+                use_filter = gr.Checkbox(True, label="Use Filter")
 
         run_btn = gr.Button("🚀 Run Pipeline", variant="primary")
 
@@ -204,9 +199,8 @@ with gr.Blocks(title="AI Support Copilot", theme=gr.themes.Soft()) as demo:
             approve_btn = gr.Button("✅ Approve & Send", variant="primary")
             reject_btn = gr.Button("❌ Reject")
 
-        # Sample Queries
         with gr.Row():
-            for q in ["Payment failed but money deducted", "My account is blocked", "Unauthorized transaction", "How to check balance?"]:
+            for q in ["Payment failed but money deducted", "Account blocked", "Unauthorized transaction", "Check balance"]:
                 gr.Button(q).click(lambda x=q: x, outputs=query_input)
 
         run_btn.click(
@@ -219,8 +213,8 @@ with gr.Blocks(title="AI Support Copilot", theme=gr.themes.Soft()) as demo:
         reject_btn.click(reject, inputs=[current_result, history_state], outputs=[history_state, status])
 
     with gr.Tab("📖 History"):
-        gr.Markdown("✅ Approve or Reject to see history here")
+        gr.Markdown("History will appear after you Approve or Reject responses.")
 
-    gr.Markdown("---\nGet free Groq key at: https://console.groq.com/keys")
+    gr.Markdown("---\nGet Groq Key: https://console.groq.com/keys")
 
 demo.launch(share=True)
