@@ -1,7 +1,6 @@
 # =============================================================================
-# WEEK 3 — AI CUSTOMER SUPPORT COPILOT (GRADIO + GROQ) - FINAL FIXED VERSION
-# Model: llama-3.3-70b-versatile (Current Best on Groq)
-# History, Approve/Reject, No fallback errors
+# WEEK 3 — AI CUSTOMER SUPPORT COPILOT (GRADIO + GROQ) - STABLE VERSION
+# Model: llama-3.1-8b-instant (Fast + Reliable)
 # =============================================================================
 
 import warnings
@@ -25,7 +24,7 @@ ARTIFACTS_PATH = "/content/drive/MyDrive/saved_models/artifacts"
 
 # ========================== LOAD ARTIFACTS ==========================
 def load_artifacts():
-    print("🔄 Loading artifacts...")
+    print("Loading artifacts...")
     with open(f'{ARTIFACTS_PATH}/tfidf_vectorizer.pkl', 'rb') as f:
         tfidf = pickle.load(f)
     with open(f'{ARTIFACTS_PATH}/best_model.pkl', 'rb') as f:
@@ -40,7 +39,7 @@ def load_artifacts():
     chroma_client = chromadb.PersistentClient(path=f'{ARTIFACTS_PATH}/chroma_db')
     collection = chroma_client.get_collection("clinc150_kb")
 
-    print("✅ Artifacts loaded!")
+    print("✅ Artifacts loaded successfully!")
     return tfidf, clf, embedder, faiss_index, collection, knowledge_base, chunk_index
 
 tfidf, clf, embedder, faiss_index, collection, knowledge_base, chunk_index = load_artifacts()
@@ -80,11 +79,8 @@ def retrieve_documents(query: str, predicted_intent: str, confidence: float, top
         filter_mode = "no_filter"
 
     try:
-        result = collection.query(
-            query_embeddings=q_emb.tolist(), 
-            n_results=top_k, 
-            where=where
-        ) if where else collection.query(query_embeddings=q_emb.tolist(), n_results=top_k)
+        result = collection.query(query_embeddings=q_emb.tolist(), n_results=top_k, where=where) if where else \
+                 collection.query(query_embeddings=q_emb.tolist(), n_results=top_k)
     except:
         result = collection.query(query_embeddings=q_emb.tolist(), n_results=top_k)
         filter_mode = "fallback"
@@ -105,17 +101,16 @@ def generate_with_groq(query: str, retrieved_docs: List[Dict], groq_key: str):
         fallback = retrieved_docs[0]['resolution'] if retrieved_docs else "Please contact customer support."
         return fallback, False
 
-    system_prompt = """You are a professional bank customer support copilot.
-Generate accurate, concise (3-5 sentences), and empathetic replies.
-Use ONLY the documents provided. Never hallucinate.
-For fraud/security: emphasize urgency + 24/7 helpline."""
+    system_prompt = """You are a helpful and professional bank customer support assistant.
+Generate clear, concise (3-5 sentences), empathetic replies.
+Use ONLY the information from the documents below. Do not hallucinate."""
 
     context = "\n\n".join([f"[{d['title']} — {d['domain']}]\n{d['resolution']}" for d in retrieved_docs])
 
     try:
         client = Groq(api_key=groq_key)
         completion = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",   # ← Updated to current model
+            model="llama-3.1-8b-instant",      # ← Stable & Fast Model
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": f"KNOWLEDGE BASE:\n{context}\n\nCUSTOMER QUERY: {query}\n\nSuggested Reply:"}
@@ -125,10 +120,10 @@ For fraud/security: emphasize urgency + 24/7 helpline."""
         )
         return completion.choices[0].message.content.strip(), True
     except Exception as e:
-        fallback = retrieved_docs[0]['resolution'] if retrieved_docs else "Our support team will help you."
-        return f"⚠️ {str(e)[:80]}...\n\nFallback: {fallback}", False
+        fallback = retrieved_docs[0]['resolution'] if retrieved_docs else "Our team will assist you shortly."
+        return f"⚠️ Groq Error: {str(e)[:100]}\n\n**Fallback:** {fallback}", False
 
-# ========================== GRADIO APP ==========================
+# ========================== GRADIO ==========================
 def process_query(query, groq_key, top_k, use_filter):
     if not query.strip():
         return "Please enter a query", None, None, None, None, []
@@ -150,25 +145,23 @@ def process_query(query, groq_key, top_k, use_filter):
         "success": success
     }
 
-    status = f"✅ Completed in {total_time}ms | Intent: **{pred_intent}** ({confidence:.1%}) | Filter: {filter_mode}"
+    status = f"✅ Done in {total_time}ms | Intent: **{pred_intent}** ({confidence:.1%})"
     return status, result, retrieved_docs, llm_response, [], []
 
 def approve(current_result, edited_response, history):
-    if not current_result:
-        return history, "Nothing to approve"
+    if not current_result: return history, "Nothing to approve"
     entry = {**current_result, "final_response": edited_response, "status": "approved", "timestamp": time.strftime("%H:%M:%S")}
     history.append(entry)
-    return history, "✅ Approved & Saved!"
+    return history, "✅ Approved!"
 
 def reject(current_result, history):
-    if not current_result:
-        return history, "Nothing to reject"
+    if not current_result: return history, "Nothing to reject"
     entry = {**current_result, "final_response": "", "status": "rejected", "timestamp": time.strftime("%H:%M:%S")}
     history.append(entry)
     return history, "❌ Rejected"
 
 with gr.Blocks(title="AI Support Copilot", theme=gr.themes.Soft()) as demo:
-    gr.Markdown("# 🤖 AI Customer Support Copilot\n**Gradio + Groq (llama-3.3-70b-versatile)**")
+    gr.Markdown("# 🤖 AI Customer Support Copilot\n**Stable Version • llama-3.1-8b-instant**")
 
     with gr.Tab("💬 Copilot"):
         groq_key = gr.Textbox(label="Groq API Key", type="password", placeholder="gsk_...")
@@ -176,42 +169,38 @@ with gr.Blocks(title="AI Support Copilot", theme=gr.themes.Soft()) as demo:
         with gr.Row():
             query_input = gr.Textbox(label="Customer Query", lines=3, placeholder="My payment failed but money was deducted...")
             with gr.Column():
-                top_k = gr.Slider(1, 5, value=3, label="Top-K Documents")
-                use_filter = gr.Checkbox(True, label="Use Intent Filter")
+                top_k = gr.Slider(1, 5, value=3, label="Top-K")
+                use_filter = gr.Checkbox(True, label="Use Filter")
 
-        run_btn = gr.Button("🚀 Run AI Pipeline", variant="primary")
+        run_btn = gr.Button("🚀 Run Pipeline", variant="primary")
 
         status = gr.Markdown("Ready")
         current_result = gr.State(None)
         history_state = gr.State([])
 
         with gr.Row():
-            intent_out = gr.Markdown()
-            docs_out = gr.JSON()
-
-        response_box = gr.Textbox(label="AI Suggested Reply (Edit before approving)", lines=8)
+            docs_out = gr.JSON(label="Retrieved Documents")
+            response_box = gr.Textbox(label="AI Suggested Reply (editable)", lines=8)
 
         with gr.Row():
-            approve_btn = gr.Button("✅ Approve & Send", variant="primary")
+            approve_btn = gr.Button("✅ Approve", variant="primary")
             reject_btn = gr.Button("❌ Reject")
 
-        # Sample queries
+        # Samples
         with gr.Row():
-            for q in ["Payment failed but money deducted", "My account is blocked", "Unauthorized transaction on card", "How do I check my balance?"]:
+            for q in ["Payment failed but money deducted", "Account is blocked", "Unauthorized transaction", "Check my balance"]:
                 gr.Button(q).click(lambda x=q: x, outputs=query_input)
 
-        run_btn.click(
-            process_query,
-            inputs=[query_input, groq_key, top_k, use_filter],
-            outputs=[status, current_result, docs_out, response_box, intent_out, history_state]
-        )
+        run_btn.click(process_query, 
+                     inputs=[query_input, groq_key, top_k, use_filter],
+                     outputs=[status, current_result, docs_out, response_box, [], history_state])
 
         approve_btn.click(approve, inputs=[current_result, response_box, history_state], outputs=[history_state, status])
         reject_btn.click(reject, inputs=[current_result, history_state], outputs=[history_state, status])
 
     with gr.Tab("📖 History"):
-        history_table = gr.DataFrame(headers=["Time", "Query", "Intent", "Status"])
+        gr.Markdown("History updates after Approve/Reject")
 
-    gr.Markdown("---\n**Get free Groq API Key:** https://console.groq.com/keys")
+    gr.Markdown("---\n**Get Groq Key:** https://console.groq.com/keys")
 
 demo.launch(share=True)
