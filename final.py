@@ -1,34 +1,30 @@
 # =============================================================================
-#  WEEK 3 — AI CUSTOMER SUPPORT COPILOT  (Gradio + Groq)
-#  Works in Google Colab without tunneling
+#  WEEK 3 — AI CUSTOMER SUPPORT COPILOT  (Gradio + Groq/Gemini)
+#  Fixed version — all demo issues resolved
 #
-#  INSTALL (one cell):
-#  pip install gradio groq sentence-transformers faiss-cpu chromadb
-#              rouge-score scikit-learn xgboost imbalanced-learn datasets
+#  FIXES IN THIS VERSION:
+#  1. Confidence always low  → LinearSVC softmax scaled properly (150 classes)
+#  2. Filter always "none"   → thresholds lowered to match real confidence range
+#  3. Button label= error    → removed keyword argument
+#  4. Broken avatars         → SVG data-URIs (no external dependency)
+#  5. Dark/Light theme       → toggle in header
+#  6. Model switcher         → Groq (5 models) + Gemini Flash dropdown
+#  7. Out-of-scope query     → added to sample queries, guardrail shown
+#  8. Eval chart removed     → cleaned up
+#  9. Week 2 retrieval summary removed → cleaned up
 #
-#  GROQ FREE API KEY:  https://console.groq.com  (free, 14400 req/day)
-#  MODEL USED: llama-3.1-8b-instant  (fastest free model, low latency)
+#  INSTALL:
+#  pip install gradio groq google-generativeai sentence-transformers
+#              faiss-cpu chromadb rouge-score scikit-learn -q
 #
-#  RUN:
-#  python week3_app.py
-#  OR in Colab:  !python week3_app.py
-#
-#  The app auto-opens in Colab's output cell.
-#  share=True gives a public URL for demo (no tunneling needed).
+#  RUN:  python week3_app_gradio.py
 # =============================================================================
 
-import os, re, json, pickle, time, textwrap
+import os, re, pickle, time, logging
 from datetime import datetime
 from typing import List, Dict, Tuple, Optional
 
 import numpy as np
-import pandas as pd
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-import matplotlib.ticker as mticker
-import seaborn as sns
-
 import gradio as gr
 from groq import Groq
 
@@ -37,832 +33,710 @@ import faiss
 import chromadb
 from rouge_score import rouge_scorer
 
+# ── Suppress noisy warnings ───────────────────────────────────────────────
+logging.getLogger("chromadb.telemetry.product.posthog").setLevel(logging.CRITICAL)
+logging.getLogger("sentence_transformers").setLevel(logging.ERROR)
+
 # =============================================================================
 #  CONFIGURATION
 # =============================================================================
 
-GROQ_API_KEY    = os.environ.get("GROQ_API_KEY", "your-groq-api-key-here")
-ARTIFACTS_DIR   = "artifacts"
+ARTIFACTS_DIR = "artifacts"
 
-# Groq model — llama-3.1-8b-instant chosen because:
-# - 14,400 free requests/day (vs Gemini 15 RPM)
-# - Sub-second latency (~0.3s)
-# - Strong instruction following
-# - No rate-limit issues for demos
-GROQ_MODEL      = "llama-3.1-8b-instant"
+# ── Available models ──────────────────────────────────────────────────────
+GROQ_MODELS = {
+    "llama-3.1-8b-instant  (fastest, recommended)":  "llama-3.1-8b-instant",
+    "llama-3.3-70b-versatile (most capable)":        "llama-3.3-70b-versatile",
+    "llama-3.1-70b-versatile (balanced)":            "llama-3.1-70b-versatile",
+    "mixtral-8x7b-32768 (large context)":            "mixtral-8x7b-32768",
+    "gemma2-9b-it (Google/Groq)":                    "gemma2-9b-it",
+}
+GEMINI_MODELS = {
+    "gemini-2.0-flash (free, fast)":  "gemini-2.0-flash",
+    "gemini-1.5-flash (free, stable)": "gemini-1.5-flash",
+}
+ALL_MODEL_LABELS = list(GROQ_MODELS.keys()) + list(GEMINI_MODELS.keys())
+DEFAULT_MODEL_LABEL = "llama-3.1-8b-instant  (fastest, recommended)"
 
-# Pipeline thresholds
-CONF_HIGH       = 0.70   # above → intent-level filter
-CONF_LOW        = 0.40   # above → domain-level filter, below → no filter
-TOP_K           = 3      # retrieved documents
+# ── Pipeline thresholds ───────────────────────────────────────────────────
+# WHY THESE VALUES:
+# LinearSVC with 150 classes produces decision_function scores that, after
+# softmax over 150 classes, rarely exceed 0.15 even for correct predictions.
+# The raw max softmax value with 150 classes averages ~1/150 ≈ 0.007 for
+# uniform distribution. A correct prediction sits at ~0.05–0.20.
+# We scale confidence to [0,1] using rank-based rescaling so the thresholds
+# make intuitive sense. See predict_intent() for details.
+CONF_HIGH = 0.55   # above → intent-level filter
+CONF_LOW  = 0.25   # above → domain-level filter, below → no filter
 
-# Guardrail settings
-MAX_INPUT_LEN   = 500    # max characters per user message
-MIN_INPUT_LEN   = 3      # min characters to process
-MAX_HISTORY     = 10     # conversation turns to keep in memory
+TOP_K         = 3
+MAX_INPUT_LEN = 500
+MIN_INPUT_LEN = 3
+MAX_HISTORY   = 10
+DRIFT_WINDOW  = 3
 
-# Topic drift: if predicted domain differs from last N turns' domain, flag it
-DRIFT_WINDOW    = 3      # turns to look back for drift detection
+# ── SVG avatars as data-URIs (no external dependency, works offline) ──────
+USER_AVATAR = (
+    "data:image/svg+xml;utf8,"
+    "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'>"
+    "<circle cx='20' cy='20' r='20' fill='%234A90D9'/>"
+    "<circle cx='20' cy='15' r='7' fill='white' opacity='0.9'/>"
+    "<ellipse cx='20' cy='34' rx='11' ry='8' fill='white' opacity='0.9'/>"
+    "</svg>"
+)
+BOT_AVATAR = (
+    "data:image/svg+xml;utf8,"
+    "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'>"
+    "<circle cx='20' cy='20' r='20' fill='%231e3a5f'/>"
+    "<rect x='10' y='13' width='20' height='14' rx='4' fill='white' opacity='0.9'/>"
+    "<circle cx='15' cy='20' r='2.5' fill='%231e3a5f'/>"
+    "<circle cx='25' cy='20' r='2.5' fill='%231e3a5f'/>"
+    "<rect x='17' y='27' width='6' height='3' rx='1' fill='white' opacity='0.9'/>"
+    "<rect x='18' y='8' width='4' height='6' rx='2' fill='white' opacity='0.9'/>"
+    "<circle cx='20' cy='8' r='2' fill='%234A90D9'/>"
+    "</svg>"
+)
 
 # =============================================================================
-#  LOAD ALL ARTIFACTS (once at startup)
+#  LOAD ARTIFACTS
 # =============================================================================
 
 print("=" * 60)
 print("  Loading AI Copilot components...")
 print("=" * 60)
 
-def load_artifacts():
-    """Load Week 1 + Week 2 artifacts."""
-    with open(f'{ARTIFACTS_DIR}/tfidf_vectorizer.pkl', 'rb') as f:
-        tfidf = pickle.load(f)
-    with open(f'{ARTIFACTS_DIR}/best_model.pkl', 'rb') as f:
-        clf = pickle.load(f)
-    with open(f'{ARTIFACTS_DIR}/label_encoder.pkl', 'rb') as f:
-        le = pickle.load(f)
-    with open(f'{ARTIFACTS_DIR}/intent_list.pkl', 'rb') as f:
-        intent_list = pickle.load(f)
-    with open(f'{ARTIFACTS_DIR}/knowledge_base.pkl', 'rb') as f:
-        knowledge_base = pickle.load(f)
-    with open(f'{ARTIFACTS_DIR}/chunk_index.pkl', 'rb') as f:
-        chunk_index = pickle.load(f)
-    return tfidf, clf, le, intent_list, knowledge_base, chunk_index
+with open(f'{ARTIFACTS_DIR}/tfidf_vectorizer.pkl', 'rb') as f:
+    tfidf = pickle.load(f)
+with open(f'{ARTIFACTS_DIR}/best_model.pkl', 'rb') as f:
+    clf = pickle.load(f)
+with open(f'{ARTIFACTS_DIR}/knowledge_base.pkl', 'rb') as f:
+    KNOWLEDGE_BASE = pickle.load(f)
+with open(f'{ARTIFACTS_DIR}/chunk_index.pkl', 'rb') as f:
+    chunk_index = pickle.load(f)
 
-tfidf, clf, le, intent_list, KNOWLEDGE_BASE, chunk_index = load_artifacts()
-print(f"  [OK] ML artifacts: {type(clf).__name__}, {len(intent_list)} intents")
+print(f"  [OK] Classifier : {type(clf).__name__}")
+print(f"  [OK] Knowledge base: {len(KNOWLEDGE_BASE)} intents")
 
-embedder = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
-print("  [OK] Embedder: all-MiniLM-L6-v2")
-
+embedder    = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
 faiss_index = faiss.read_index(f'{ARTIFACTS_DIR}/faiss_index.bin')
-print(f"  [OK] FAISS index: {faiss_index.ntotal} vectors")
+print(f"  [OK] Embedder + FAISS ({faiss_index.ntotal} vectors)")
 
 chroma_client = chromadb.PersistentClient(path=f'{ARTIFACTS_DIR}/chroma_db')
-collection = chroma_client.get_collection("clinc150_kb")
-print(f"  [OK] Chroma: {collection.count()} documents")
-
-groq_client = Groq(api_key=GROQ_API_KEY)
-print(f"  [OK] Groq client: model={GROQ_MODEL}")
+collection    = chroma_client.get_collection("clinc150_kb")
+print(f"  [OK] Chroma: {collection.count()} docs")
 print("=" * 60)
 
 # =============================================================================
 #  GUARDRAILS
 # =============================================================================
 
-# Input blocklist — queries that should be refused
 BLOCKED_PATTERNS = [
-    r'\b(hack|exploit|bypass|jailbreak|ignore previous|ignore above|disregard|forget instructions)\b',
-    r'\b(bomb|weapon|kill|attack|terror)\b',
-    r'<script|javascript:|onclick=|onerror=',    # XSS attempts
-    r'(select\s+\*\s+from|drop\s+table|insert\s+into)',  # SQL injection
+    r'\b(hack|exploit|bypass|jailbreak|ignore\s+previous|ignore\s+above|disregard\s+instructions|forget\s+instructions)\b',
+    r'\b(bomb|weapon|kill|attack|terror|suicide)\b',
+    r'<script|javascript:|onclick=|onerror=',
+    r'(select\s+\*\s+from|drop\s+table|insert\s+into)',
 ]
 
-# Off-topic domains: queries the copilot should redirect
 OFF_TOPIC_PHRASES = [
-    'politics', 'election', 'vote', 'sports score', 'movie',
-    'song lyrics', 'recipe for', 'homework', 'essay', 'poem about',
-    'covid', 'medical advice', 'diagnosis', 'prescription',
+    'election', 'vote for', 'sports score', 'movie review',
+    'song lyrics', 'homework help', 'write my essay',
+    'medical advice', 'diagnosis', 'prescription',
+    'stock tips', 'crypto advice',
 ]
 
-# Banking/support topic keywords — used for topic drift detection
-BANKING_KEYWORDS = {
-    'Banking', 'Credit Cards', 'Travel', 'Utilities', 'Home',
-    'Auto & Commute', 'Small Talk', 'Meta', 'Shopping', 'General'
-}
+CLARIFICATION_PHRASES = [
+    "didn't understand", "don't understand", "not clear", "confused",
+    "can you explain", "what do you mean", "please clarify", "elaborate",
+    "i'm lost", "can you repeat", "didn't get that", "please explain again",
+    "rephrase", "simpler", "in simple terms", "i don't get it",
+    "not helpful", "still confused", "couldn't understand",
+]
 
 def guardrail_input(text: str) -> Tuple[bool, str]:
-    """
-    INPUT GUARDRAILS:
-    1. Length check
-    2. Blocked patterns (prompt injection, harmful content)
-    3. Off-topic detection
-    Returns (is_safe, rejection_message_or_empty)
-    """
     if len(text.strip()) < MIN_INPUT_LEN:
         return False, "Please enter a valid query (at least 3 characters)."
-
     if len(text) > MAX_INPUT_LEN:
         return False, f"Query too long ({len(text)} chars). Please keep it under {MAX_INPUT_LEN} characters."
-
-    text_lower = text.lower()
-    for pattern in BLOCKED_PATTERNS:
-        if re.search(pattern, text_lower, re.IGNORECASE):
-            return False, ("⚠️ I cannot process that request. This appears to contain "
-                          "content that violates usage policy. Please ask a genuine support question.")
-
+    t = text.lower()
+    for pat in BLOCKED_PATTERNS:
+        if re.search(pat, t, re.IGNORECASE):
+            return False, ("🛡️ This request contains content that violates usage policy. "
+                           "Please ask a genuine banking or service-related question.")
     for phrase in OFF_TOPIC_PHRASES:
-        if phrase in text_lower:
-            return False, (f"I'm a customer support assistant for banking and financial services. "
-                          f"I'm not able to help with '{phrase}' topics. "
-                          f"Please ask about your account, transactions, cards, travel bookings, or other services.")
-
+        if phrase in t:
+            return False, (f"🛡️ I'm a customer support assistant for banking and financial services. "
+                           f"I can't help with '{phrase}'. "
+                           f"Please ask about your account, cards, travel, or other banking services.")
     return True, ""
 
 def guardrail_output(response: str, retrieved_docs: List[Dict]) -> Tuple[str, List[str]]:
-    """
-    OUTPUT GUARDRAILS:
-    1. Hallucination check — flag if response contains information not in retrieved docs
-    2. PII leakage check — block if response contains card/account number patterns
-    3. Response length check
-    Returns (validated_response, list_of_warnings)
-    """
     warnings = []
-
-    # PII leakage — block card/account numbers
     pii_patterns = [
-        r'\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b',  # card number
-        r'\b\d{9,18}\b',                                    # account number
-        r'\b\d{3}[-.\s]?\d{2}[-.\s]?\d{4}\b',             # SSN-like
+        r'\b\d{4}[\s\-]?\d{4}[\s\-]?\d{4}[\s\-]?\d{4}\b',
+        r'\b\d{9,18}\b',
     ]
     for pat in pii_patterns:
         if re.search(pat, response):
-            warnings.append("⚠️ Response may contain sensitive numbers — please review before sending.")
+            warnings.append("⚠️ Response may contain sensitive numbers — review before sending.")
             break
-
-    # Hallucination proxy — check if key factual claims in response
-    # appear to be grounded in retrieved docs
     if retrieved_docs:
-        all_retrieved_text = " ".join([d.get('resolution', '') + " " + d.get('policy', '')
-                                       for d in retrieved_docs]).lower()
-        response_words = set(re.findall(r'\b[a-z]{4,}\b', response.lower()))
-        retrieved_words = set(re.findall(r'\b[a-z]{4,}\b', all_retrieved_text))
-        overlap = len(response_words & retrieved_words) / max(len(response_words), 1)
-        if overlap < 0.15:
-            warnings.append("⚠️ Low grounding score — response may contain information not in knowledge base. Verify before sending.")
-
-    # Length check
-    if len(response.split()) < 5:
-        warnings.append("⚠️ Response is very short. Consider elaborating.")
-    if len(response.split()) > 150:
-        response = " ".join(response.split()[:150]) + "..."
-        warnings.append("ℹ️ Response trimmed to 150 words for conciseness.")
-
+        all_text   = " ".join([d.get('resolution','') for d in retrieved_docs]).lower()
+        r_words    = set(re.findall(r'\b[a-z]{4,}\b', response.lower()))
+        kb_words   = set(re.findall(r'\b[a-z]{4,}\b', all_text))
+        overlap    = len(r_words & kb_words) / max(len(r_words), 1)
+        if overlap < 0.12:
+            warnings.append("⚠️ Low faithfulness — verify response is grounded in KB.")
+    if len(response.split()) > 160:
+        response = " ".join(response.split()[:160]) + "..."
+        warnings.append("ℹ️ Response trimmed to 160 words.")
     return response, warnings
 
-def detect_topic_drift(current_domain: str, history: List[Dict]) -> Tuple[bool, str]:
-    """
-    TOPIC DRIFT DETECTION:
-    Look at last DRIFT_WINDOW turns. If current domain is different
-    from all recent turns' domains, flag it as a topic change.
-    This helps the LLM understand context shifts.
-    """
-    if len(history) < 2:
+def is_clarification(text: str) -> bool:
+    t = text.lower()
+    return any(p in t for p in CLARIFICATION_PHRASES)
+
+def detect_drift(current_domain: str, state: List[Dict]) -> Tuple[bool, str]:
+    recent = [s.get('domain','') for s in state[-DRIFT_WINDOW:]
+              if s.get('role') == 'assistant' and s.get('domain')]
+    if not recent:
         return False, ""
-
-    recent_domains = [h.get('domain', '') for h in history[-DRIFT_WINDOW:]
-                      if h.get('role') == 'assistant' and h.get('domain')]
-
-    if not recent_domains:
-        return False, ""
-
-    # If current domain different from majority of recent domains
-    most_common = max(set(recent_domains), key=recent_domains.count)
-    if current_domain != most_common and most_common != '' and current_domain != 'General':
-        return True, f"Topic changed from {most_common} to {current_domain}"
-
+    most_common = max(set(recent), key=recent.count)
+    if current_domain and current_domain != most_common and most_common not in ('', 'General'):
+        return True, f"{most_common} → {current_domain}"
     return False, ""
 
 # =============================================================================
-#  CORE PIPELINE FUNCTIONS
+#  CONFIDENCE RESCALING
+#  WHY: LinearSVC.decision_function returns raw margin scores. After softmax
+#  over 150 classes, the max probability is tiny (~0.02-0.15) because the
+#  softmax denominator sums 150 terms. This makes ALL queries look low
+#  confidence and the filter always falls to "none".
+#
+#  FIX: Rank-based rescaling. The argmax class's rank among 150 scores
+#  is always rank 1 (by definition). We use the margin gap between the
+#  top-1 and top-2 scores, normalized by the score range, to get a
+#  meaningful [0,1] confidence. Large gap = high confidence. Small gap =
+#  ambiguous. This correctly reflects classifier certainty.
 # =============================================================================
 
-def clean_text(text: str) -> str:
-    text = text.lower()
-    text = re.sub(r"[^a-z0-9'\s]", ' ', text)
-    return re.sub(r"\s+", ' ', text).strip()
-
 def predict_intent(query: str) -> Tuple[str, float, Dict]:
-    """
-    WEEK 1 CLASSIFIER
-    Returns intent, confidence, and top-5 predictions dict.
-    """
-    vec = tfidf.transform([clean_text(query)])
+    vec  = tfidf.transform([_clean(query)])
     pred = clf.predict(vec)[0]
 
     if hasattr(clf, 'decision_function'):
-        scores = clf.decision_function(vec)[0]
-        exp_s  = np.exp(scores - np.max(scores))
-        proba  = exp_s / exp_s.sum()
-        conf   = float(np.max(proba))
-        classes = clf.classes_
-        top5_idx = np.argsort(proba)[::-1][:5]
-        top5 = {classes[i]: float(proba[i]) for i in top5_idx}
+        raw    = clf.decision_function(vec)[0]          # shape (150,)
+        sorted_scores = np.sort(raw)[::-1]
+        top1   = sorted_scores[0]
+        top2   = sorted_scores[1]
+        gap    = top1 - top2                             # margin gap
+        span   = raw.max() - raw.min()
+        # Normalize gap by score span → [0, 1]
+        conf   = float(np.clip(gap / max(span, 1e-6), 0, 1))
+
+        classes  = clf.classes_
+        top5_idx = np.argsort(raw)[::-1][:5]
+        # Show top-5 as relative scores for display
+        top5_raw = raw[top5_idx]
+        top5_rel = (top5_raw - top5_raw.min()) / max(top5_raw.max() - top5_raw.min(), 1e-6)
+        top5     = {classes[i]: float(top5_rel[j]) for j, i in enumerate(top5_idx)}
+
     elif hasattr(clf, 'predict_proba'):
-        proba  = clf.predict_proba(vec)[0]
-        conf   = float(np.max(proba))
-        classes = clf.classes_
+        proba    = clf.predict_proba(vec)[0]
+        conf     = float(np.max(proba))
+        classes  = clf.classes_
         top5_idx = np.argsort(proba)[::-1][:5]
-        top5 = {classes[i]: float(proba[i]) for i in top5_idx}
+        top5     = {classes[i]: float(proba[i]) for i in top5_idx}
     else:
         conf = 0.8
         top5 = {pred: 0.8}
 
     return pred, conf, top5
 
-def retrieve_documents(query: str, predicted_intent: str, confidence: float,
-                       top_k: int = TOP_K) -> Tuple[List[Dict], str]:
-    """
-    WEEK 2 RETRIEVAL — Chroma with confidence-based intent filtering.
-    confidence >= 0.70 → intent filter (tight)
-    confidence >= 0.40 → domain filter (medium)
-    confidence <  0.40 → no filter (open search)
-    """
-    q_emb = embedder.encode([query], normalize_embeddings=True).tolist()
-    predicted_domain = KNOWLEDGE_BASE.get(predicted_intent, {}).get("domain", "General")
+def _clean(text: str) -> str:
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9'\s]", ' ', text)
+    return re.sub(r"\s+", ' ', text).strip()
 
-    if confidence >= CONF_HIGH and predicted_intent in KNOWLEDGE_BASE:
-        where_filter  = {"intent": {"$eq": predicted_intent}}
-        filter_mode   = "intent"
-    elif confidence >= CONF_LOW:
-        where_filter  = {"domain": {"$eq": predicted_domain}}
-        filter_mode   = "domain"
+# =============================================================================
+#  RETRIEVAL
+# =============================================================================
+
+def retrieve_docs(query: str, intent: str, conf: float) -> Tuple[List[Dict], str]:
+    q_emb  = embedder.encode([query], normalize_embeddings=True).tolist()
+    domain = KNOWLEDGE_BASE.get(intent, {}).get("domain", "General")
+
+    if conf >= CONF_HIGH and intent in KNOWLEDGE_BASE:
+        where_filter = {"intent": {"$eq": intent}}
+        mode         = "intent"
+    elif conf >= CONF_LOW:
+        where_filter = {"domain": {"$eq": domain}}
+        mode         = "domain"
     else:
-        where_filter  = None
-        filter_mode   = "none"
+        where_filter = None
+        mode         = "none"
 
     try:
         if where_filter:
             result = collection.query(
                 query_embeddings=q_emb,
-                n_results=min(top_k, collection.count()),
+                n_results=min(TOP_K, collection.count()),
                 where=where_filter
             )
         else:
-            result = collection.query(query_embeddings=q_emb, n_results=top_k)
+            result = collection.query(query_embeddings=q_emb, n_results=TOP_K)
     except Exception:
-        result = collection.query(query_embeddings=q_emb, n_results=top_k)
-        filter_mode = "fallback"
+        result = collection.query(query_embeddings=q_emb, n_results=TOP_K)
+        mode   = "fallback"
 
     docs = []
-    for doc_id, doc_text, meta, dist in zip(
+    for did, dtxt, meta, dist in zip(
         result['ids'][0], result['documents'][0],
         result['metadatas'][0], result['distances'][0]
     ):
         docs.append({
-            "chunk_id":       doc_id,
-            "intent":         meta["intent"],
-            "domain":         meta["domain"],
-            "title":          meta["title"],
-            "text":           doc_text,
-            "resolution":     KNOWLEDGE_BASE.get(meta["intent"], {}).get("resolution", doc_text),
-            "policy":         KNOWLEDGE_BASE.get(meta["intent"], {}).get("policy", ""),
-            "retrieval_score": float(1 - dist),
-            "filter_mode":    filter_mode,
+            "intent":   meta["intent"],
+            "domain":   meta["domain"],
+            "title":    meta["title"],
+            "resolution": KNOWLEDGE_BASE.get(meta["intent"], {}).get("resolution", dtxt),
+            "policy":     KNOWLEDGE_BASE.get(meta["intent"], {}).get("policy", ""),
+            "score":    float(1 - dist),
+            "mode":     mode,
         })
-    return docs, filter_mode
+    return docs, mode
 
-def build_groq_messages(query: str, retrieved_docs: List[Dict],
-                        history: List[Dict], drift_flag: bool,
-                        drift_msg: str, clarification_mode: bool) -> List[Dict]:
-    """
-    Build message list for Groq chat API.
-    Includes:
-    - System prompt with guardrails
-    - Conversation history (last MAX_HISTORY turns) for context memory
-    - Topic drift notice if detected
-    - Clarification instruction if user said they didn't understand
-    - Retrieved documents as context
-    """
-    # Build context from retrieved docs
-    context_parts = []
-    for i, doc in enumerate(retrieved_docs, 1):
-        context_parts.append(
-            f"[Doc {i}: {doc['title']} — {doc['domain']}]\n"
-            f"Resolution: {doc['resolution']}\n"
-            f"Policy: {doc['policy']}"
-        )
-    context_str = "\n\n".join(context_parts)
+# =============================================================================
+#  LLM GENERATION  (Groq or Gemini, selectable in UI)
+# =============================================================================
 
-    drift_note = ""
-    if drift_flag:
-        drift_note = f"\nNOTE: The customer's topic has changed ({drift_msg}). Address the new topic directly.\n"
+def _build_prompt(query: str, docs: List[Dict], state: List[Dict],
+                  drift: bool, drift_msg: str, clarify: bool) -> Tuple[str, List[Dict]]:
+    ctx = "\n\n".join([
+        f"[Doc {i+1}: {d['title']} — {d['domain']}]\n{d['resolution']}\nPolicy: {d['policy']}"
+        for i, d in enumerate(docs)
+    ])
+    drift_note   = f"\nNOTE: Topic shifted ({drift_msg}). Address the new topic.\n" if drift else ""
+    clarify_note = ("\nIMPORTANT: Customer did not understand previous reply. "
+                    "Rephrase simply with a concrete example.\n") if clarify else ""
 
-    clarification_note = ""
-    if clarification_mode:
-        clarification_note = (
-            "\nIMPORTANT: The customer said they did not understand the previous answer. "
-            "Rephrase your last response in simpler language with a concrete example if possible. "
-            "Do not repeat the same wording.\n"
-        )
-
-    system_prompt = f"""You are an AI customer support copilot for a bank and financial services company.
-Your task is to generate accurate, concise (3–5 sentences), and empathetic suggested replies for support agents.
-
-STRICT RULES:
-1. Use ONLY information from the retrieved knowledge base documents below.
-2. Never guess, hallucinate, or make up policies, numbers, or procedures.
-3. If the documents do not contain relevant information, say: "I don't have specific information on that — please connect the customer with a specialist."
-4. For fraud/security issues: always direct to 24/7 fraud helpline immediately.
-5. Keep response to 3–5 sentences maximum. Professional and empathetic tone.
-6. Plain text only — no markdown, no bullet points, no asterisks.
-7. Start directly with the resolution. No filler phrases.
-8. Address the customer as "you" and "your".
-9. End with an offer for further assistance.
-{drift_note}{clarification_note}
-RETRIEVED KNOWLEDGE BASE:
-{context_str}
-"""
-    messages = [{"role": "system", "content": system_prompt}]
-
-    # Add conversation history for context memory (last MAX_HISTORY turns)
-    recent = [h for h in history if h.get('role') in ('user', 'assistant')][-MAX_HISTORY:]
-    for h in recent:
-        if h['role'] in ('user', 'assistant'):
-            messages.append({"role": h['role'], "content": h['content']})
-
-    # Current query
+    system = (
+        "You are an AI customer support copilot for a bank and financial services company. "
+        "Generate accurate, concise (3–5 sentences), empathetic suggested replies for support agents.\n\n"
+        "RULES:\n"
+        "1. Use ONLY information from the retrieved documents below.\n"
+        "2. Never guess or hallucinate policies or numbers.\n"
+        "3. If documents lack relevant info, say: 'I don't have specific info — connect customer to a specialist.'\n"
+        "4. Fraud/security: always direct to 24/7 helpline immediately.\n"
+        "5. Plain text only — no markdown, bullets, or asterisks.\n"
+        "6. Start directly with resolution. No filler phrases.\n"
+        "7. Address customer as 'you'/'your'. End with offer to help further.\n"
+        f"{drift_note}{clarify_note}\n"
+        f"KNOWLEDGE BASE:\n{ctx}"
+    )
+    # Build conversation history for context memory
+    messages = [{"role": "system", "content": system}]
+    recent = [s for s in state if s.get('role') in ('user','assistant')][-MAX_HISTORY:]
+    for s in recent:
+        messages.append({"role": s['role'], "content": s['content']})
     messages.append({"role": "user", "content": query})
-    return messages
+    return system, messages
 
-def generate_with_groq(messages: List[Dict]) -> Dict:
-    """
-    Call Groq API with llama-3.1-8b-instant.
-    WHY GROQ over Gemini:
-    - 14,400 free requests/day vs Gemini's 15 RPM (≈900/day)
-    - ~0.3s latency vs ~1.5s for Gemini
-    - No rate-limit errors during demo
-    - llama-3.1-8b-instant is specifically optimised for low-latency inference
-    """
-    try:
-        response = groq_client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=messages,
-            max_tokens=300,
-            temperature=0.3,    # Low temp = factual, consistent
-            top_p=0.9,
-        )
-        text = response.choices[0].message.content.strip()
-        usage = response.usage
-        return {
-            "response": text,
-            "success": True,
-            "model": GROQ_MODEL,
-            "input_tokens":  usage.prompt_tokens,
-            "output_tokens": usage.completion_tokens,
-        }
-    except Exception as e:
-        return {
-            "response": f"LLM unavailable: {e}",
-            "success": False,
-            "model": GROQ_MODEL,
-            "input_tokens": 0,
-            "output_tokens": 0,
-        }
+def generate(query: str, docs: List[Dict], state: List[Dict],
+             drift: bool, drift_msg: str, clarify: bool,
+             model_label: str, groq_key: str, gemini_key: str) -> Dict:
 
-def compute_quality_metrics(generated: str, retrieved_docs: List[Dict]) -> Dict:
-    """Compute ROUGE-L and faithfulness proxy for the generated response."""
-    rouge = rouge_scorer.RougeScorer(['rougeL', 'rouge1'], use_stemmer=True)
-    reference = retrieved_docs[0]['resolution'] if retrieved_docs else ""
-    sc = rouge.score(reference, generated)
+    system_str, messages = _build_prompt(query, docs, state, drift, drift_msg, clarify)
 
-    ref_words = set(re.findall(r'\b[a-z]{4,}\b', reference.lower()))
-    gen_words = set(re.findall(r'\b[a-z]{4,}\b', generated.lower()))
-    faithfulness = len(ref_words & gen_words) / max(len(ref_words), 1)
+    # Determine provider
+    is_gemini = model_label in GEMINI_MODELS
+    model_id  = GEMINI_MODELS.get(model_label) or GROQ_MODELS.get(model_label, "llama-3.1-8b-instant")
 
+    if is_gemini:
+        try:
+            import google.generativeai as genai
+            key = gemini_key.strip() or os.environ.get("GOOGLE_API_KEY","")
+            if not key:
+                return {"response":"No Gemini API key provided.","success":False,"model":model_id,"tokens":0}
+            genai.configure(api_key=key)
+            m   = genai.GenerativeModel(model_id)
+            # Gemini doesn't support system role in messages — inject into user turn
+            prompt = system_str + "\n\nCustomer query: " + query
+            resp   = m.generate_content(
+                prompt,
+                generation_config=genai.types.GenerationConfig(max_output_tokens=300, temperature=0.3)
+            )
+            return {"response": resp.text.strip(), "success": True, "model": model_id, "tokens": 0}
+        except Exception as e:
+            return {"response": f"Gemini error: {e}", "success": False, "model": model_id, "tokens": 0}
+    else:
+        try:
+            key = groq_key.strip() or os.environ.get("GROQ_API_KEY","")
+            if not key:
+                return {"response":"No Groq API key provided.","success":False,"model":model_id,"tokens":0}
+            client   = Groq(api_key=key)
+            response = client.chat.completions.create(
+                model=model_id,
+                messages=messages,
+                max_tokens=300,
+                temperature=0.3,
+                top_p=0.9,
+            )
+            text   = response.choices[0].message.content.strip()
+            tokens = response.usage.completion_tokens
+            return {"response": text, "success": True, "model": model_id, "tokens": tokens}
+        except Exception as e:
+            return {"response": f"Groq error: {e}", "success": False, "model": model_id, "tokens": 0}
+
+def quality_metrics(generated: str, docs: List[Dict]) -> Dict:
+    rouge  = rouge_scorer.RougeScorer(['rougeL','rouge1'], use_stemmer=True)
+    ref    = docs[0]['resolution'] if docs else ""
+    sc     = rouge.score(ref, generated)
+    rw     = set(re.findall(r'\b[a-z]{4,}\b', ref.lower()))
+    gw     = set(re.findall(r'\b[a-z]{4,}\b', generated.lower()))
+    faith  = len(rw & gw) / max(len(rw), 1)
     return {
-        "rougeL":      round(sc['rougeL'].fmeasure, 4),
-        "rouge1":      round(sc['rouge1'].fmeasure, 4),
-        "faithfulness": round(faithfulness, 4),
-        "word_count":  len(generated.split()),
+        "rougeL":      round(sc['rougeL'].fmeasure, 3),
+        "rouge1":      round(sc['rouge1'].fmeasure, 3),
+        "faithfulness": round(faith, 3),
+        "words":       len(generated.split()),
     }
 
 # =============================================================================
-#  CLARIFICATION DETECTOR
+#  PANEL HTML BUILDERS
 # =============================================================================
 
-CLARIFICATION_PHRASES = [
-    "didn't understand", "don't understand", "not clear", "confused",
-    "can you explain", "what do you mean", "please clarify", "elaborate",
-    "i'm lost", "can you repeat", "didn't get that", "please explain again",
-    "rephrase", "simpler", "in simple terms", "what does that mean",
-    "i don't get it", "not helpful", "still confused"
-]
+def _intent_html(intent: str, domain: str, conf: float, mode: str, top5: Dict) -> str:
+    pct   = int(conf * 100)
+    color = "#27ae60" if pct >= 55 else "#f39c12" if pct >= 25 else "#e74c3c"
+    mode_label = {
+        "intent":   ("Intent filter active", "#0c447c", "#e6f1fb"),
+        "domain":   ("Domain filter active", "#085041", "#e1f5ee"),
+        "none":     ("No filter — open search", "#633806", "#faeeda"),
+        "fallback": ("Filter fallback", "#7B2D8B", "#f3e8f9"),
+    }.get(mode, ("Unknown", "#555", "#f5f5f5"))
 
-def is_clarification_request(text: str) -> bool:
-    t = text.lower()
-    return any(phrase in t for phrase in CLARIFICATION_PHRASES)
+    rows = ""
+    for nm, val in list(top5.items())[:5]:
+        w = int(val * 150)
+        rows += (f"<tr><td style='padding:2px 8px;font-size:12px;font-family:monospace'>{nm}</td>"
+                 f"<td><div style='background:#e9ecef;border-radius:3px;height:10px;width:150px'>"
+                 f"<div style='background:#2d6a9f;width:{w}px;height:10px;border-radius:3px'></div>"
+                 f"</div></td>"
+                 f"<td style='padding:0 8px;font-size:11px;color:#666'>{val:.3f}</td></tr>")
 
-# =============================================================================
-#  BACKEND LOG (printed to terminal + shown in UI)
-# =============================================================================
-
-def format_backend_log(query, intent, domain, conf, filter_mode,
-                       docs, llm_result, quality, timings,
-                       drift_flag, drift_msg, warnings,
-                       clarification_mode) -> str:
-    """Format a detailed backend trace for display in UI debug panel."""
-    ts = datetime.now().strftime("%H:%M:%S")
-    log_lines = [
-        f"{'='*56}",
-        f"  PIPELINE TRACE  [{ts}]",
-        f"{'='*56}",
-        f"",
-        f"[INPUT GUARDRAILS]   PASSED",
-        f"",
-        f"[STEP 1 — ML CLASSIFICATION]",
-        f"  Query         : {query[:80]}",
-        f"  Predicted intent: {intent}",
-        f"  Domain        : {domain}",
-        f"  Confidence    : {conf:.4f}  ({conf*100:.1f}%)",
-        f"  Routing       : {'intent filter' if conf>=CONF_HIGH else 'domain filter' if conf>=CONF_LOW else 'no filter'}",
-        f"  Classify time : {timings['classify_ms']}ms",
-        f"",
-        f"[STEP 2 — RETRIEVAL]",
-        f"  Filter mode   : {filter_mode}",
-        f"  Documents     : {len(docs)} retrieved",
-    ]
-    for i, d in enumerate(docs, 1):
-        log_lines.append(f"  Doc {i}: {d['title']} ({d['domain']}) — score: {d['retrieval_score']:.4f}")
-    log_lines += [
-        f"  Retrieve time : {timings['retrieve_ms']}ms",
-        f"",
-        f"[STEP 3 — LLM GENERATION]",
-        f"  Model         : {llm_result.get('model', GROQ_MODEL)}",
-        f"  Input tokens  : {llm_result.get('input_tokens', 'N/A')}",
-        f"  Output tokens : {llm_result.get('output_tokens', 'N/A')}",
-        f"  LLM time      : {timings['llm_ms']}ms",
-        f"  LLM success   : {llm_result.get('success', False)}",
-        f"",
-        f"[STEP 4 — OUTPUT GUARDRAILS]",
-        f"  ROUGE-L       : {quality['rougeL']}",
-        f"  Faithfulness  : {quality['faithfulness']}",
-        f"  Word count    : {quality['word_count']}",
-    ]
-    if warnings:
-        log_lines.append(f"  WARNINGS      : {' | '.join(warnings)}")
-    log_lines += [
-        f"",
-        f"[CONTEXT & DRIFT]",
-        f"  Topic drift   : {'YES — ' + drift_msg if drift_flag else 'No'}",
-        f"  Clarification : {'YES — rephrasing' if clarification_mode else 'No'}",
-        f"",
-        f"[TOTAL PIPELINE TIME]   {timings['total_ms']}ms",
-        f"{'='*56}",
-    ]
-    return "\n".join(log_lines)
-
-# =============================================================================
-#  MAIN CHAT FUNCTION (called by Gradio on every message)
-# =============================================================================
-
-def chat(user_message: str, history: List[List], backend_state: List[Dict],
-         api_key_state: str) -> Tuple:
-    """
-    Main pipeline function.
-    Parameters:
-      user_message  : current user input
-      history       : Gradio chat history [[user, bot], ...]
-      backend_state : list of per-turn pipeline metadata dicts
-      api_key_state : Groq API key from textbox
-
-    Returns:
-      ("", updated_history, updated_backend_state,
-       backend_log_text, intent_badge_html, docs_html,
-       metrics_html, eval_chart_fig)
-    """
-    if api_key_state.strip():
-        groq_client.api_key = api_key_state.strip()
-        os.environ["GROQ_API_KEY"] = api_key_state.strip()
-
-    t_start = time.time()
-
-    # ── INPUT GUARDRAILS ───────────────────────────────────────────────────
-    is_safe, rejection_msg = guardrail_input(user_message)
-    if not is_safe:
-        bot_msg = f"🛡️ {rejection_msg}"
-        history.append([user_message, bot_msg])
-        backend_state.append({
-            "role": "assistant", "content": bot_msg,
-            "domain": "N/A", "intent": "BLOCKED",
-        })
-        log = f"[GUARDRAIL BLOCKED]\n  Reason: {rejection_msg}"
-        intent_html = _intent_html("BLOCKED", "N/A", 0.0, "intent", {})
-        docs_html   = "<p style='color:#888'>Query blocked by guardrails.</p>"
-        metrics_html= "<p style='color:#888'>N/A</p>"
-        return "", history, backend_state, log, intent_html, docs_html, metrics_html, None
-
-    clarification_mode = is_clarification_request(user_message)
-    t_classify_start   = time.time()
-
-    # ── STEP 1: ML CLASSIFICATION ──────────────────────────────────────────
-    predicted_intent, confidence, top5 = predict_intent(user_message)
-    predicted_domain = KNOWLEDGE_BASE.get(predicted_intent, {}).get("domain", "General")
-    t_classify_ms = int((time.time() - t_classify_start) * 1000)
-
-    # ── TOPIC DRIFT DETECTION ──────────────────────────────────────────────
-    drift_flag, drift_msg = detect_topic_drift(predicted_domain, backend_state)
-
-    # ── STEP 2: RETRIEVAL ─────────────────────────────────────────────────
-    t_ret_start = time.time()
-    retrieved_docs, filter_mode = retrieve_documents(
-        user_message, predicted_intent, confidence, TOP_K
-    )
-    t_retrieve_ms = int((time.time() - t_ret_start) * 1000)
-
-    # ── STEP 3: LLM GENERATION ────────────────────────────────────────────
-    t_llm_start = time.time()
-    messages    = build_groq_messages(
-        user_message, retrieved_docs, backend_state,
-        drift_flag, drift_msg, clarification_mode
-    )
-    llm_result  = generate_with_groq(messages)
-    t_llm_ms    = int((time.time() - t_llm_start) * 1000)
-
-    raw_response = llm_result["response"]
-
-    # ── STEP 4: OUTPUT GUARDRAILS ─────────────────────────────────────────
-    validated_response, out_warnings = guardrail_output(raw_response, retrieved_docs)
-
-    # ── QUALITY METRICS ───────────────────────────────────────────────────
-    quality = compute_quality_metrics(validated_response, retrieved_docs)
-
-    t_total_ms = int((time.time() - t_start) * 1000)
-    timings    = {
-        "classify_ms": t_classify_ms,
-        "retrieve_ms": t_retrieve_ms,
-        "llm_ms":      t_llm_ms,
-        "total_ms":    t_total_ms,
-    }
-
-    # ── FORMAT CHATBOT RESPONSE ───────────────────────────────────────────
-    # Show warnings inline if any
-    display_response = validated_response
-    if out_warnings:
-        display_response += "\n\n" + "\n".join(out_warnings)
-    if drift_flag:
-        display_response = f"[Topic shift detected: {drift_msg}]\n\n{display_response}"
-
-    # Update history + state
-    history.append([user_message, display_response])
-    backend_state.append({
-        "role":    "user",
-        "content": user_message,
-        "domain":  predicted_domain,
-        "intent":  predicted_intent,
-    })
-    backend_state.append({
-        "role":          "assistant",
-        "content":       display_response,
-        "domain":        predicted_domain,
-        "intent":        predicted_intent,
-        "confidence":    confidence,
-        "filter_mode":   filter_mode,
-        "quality":       quality,
-    })
-
-    # Trim state to avoid unbounded growth
-    if len(backend_state) > MAX_HISTORY * 2:
-        backend_state = backend_state[-(MAX_HISTORY * 2):]
-
-    # ── BUILD UI PANELS ───────────────────────────────────────────────────
-    backend_log  = format_backend_log(
-        user_message, predicted_intent, predicted_domain, confidence,
-        filter_mode, retrieved_docs, llm_result, quality, timings,
-        drift_flag, drift_msg, out_warnings, clarification_mode
-    )
-    intent_html  = _intent_html(predicted_intent, predicted_domain, confidence, filter_mode, top5)
-    docs_html    = _docs_html(retrieved_docs, filter_mode)
-    metrics_html = _metrics_html(quality, timings, llm_result)
-    eval_fig     = _build_eval_chart(backend_state)
-
-    print(backend_log)   # also print to terminal / Colab cell
-
-    return "", history, backend_state, backend_log, intent_html, docs_html, metrics_html, eval_fig
-
-# =============================================================================
-#  UI PANEL BUILDERS
-# =============================================================================
-
-def _intent_html(intent: str, domain: str, conf: float, filter_mode: str, top5: Dict) -> str:
-    conf_pct   = int(conf * 100)
-    conf_color = "#27ae60" if conf_pct >= 70 else "#f39c12" if conf_pct >= 40 else "#e74c3c"
-    filter_colors = {
-        "intent": ("#0c447c", "#e6f1fb"),
-        "domain": ("#085041", "#e1f5ee"),
-        "none":   ("#633806", "#faeeda"),
-        "fallback": ("#7B2D8B", "#f3e8f9"),
-    }
-    fc, fb = filter_colors.get(filter_mode, ("#555", "#f5f5f5"))
-
-    top5_rows = ""
-    for int_name, prob in list(top5.items())[:5]:
-        bar_w = int(prob * 160)
-        top5_rows += (
-            f"<tr><td style='padding:3px 8px;font-size:12px;font-family:monospace'>{int_name}</td>"
-            f"<td><div style='background:#e9ecef;border-radius:4px;height:12px;width:160px'>"
-            f"<div style='background:#2d6a9f;width:{bar_w}px;height:12px;border-radius:4px'></div>"
-            f"</div></td>"
-            f"<td style='padding:0 8px;font-size:12px;color:#555'>{prob:.4f}</td></tr>"
-        )
-
-    html = f"""
-<div style="font-family:sans-serif;padding:12px">
-  <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:10px">
-    <div style="background:#e6f1fb;border:1px solid #b5d4f4;border-radius:20px;
-                padding:5px 16px;font-size:13px;font-weight:600;color:#0c447c">
-      🎯 {intent}
-    </div>
-    <div style="background:#e1f5ee;border:1px solid #9fe1cb;border-radius:20px;
-                padding:5px 16px;font-size:13px;font-weight:600;color:#085041">
-      🏷️ {domain}
-    </div>
-    <div style="background:{fb};border:1px solid {fc};border-radius:20px;
-                padding:5px 16px;font-size:12px;font-weight:600;color:{fc}">
-      🔍 Filter: {filter_mode}
+    return f"""
+<div style='font-family:sans-serif;padding:10px'>
+  <div style='display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px'>
+    <span style='background:#e6f1fb;border:1px solid #b5d4f4;border-radius:16px;
+                 padding:4px 14px;font-size:13px;font-weight:600;color:#0c447c'>🎯 {intent}</span>
+    <span style='background:#e1f5ee;border:1px solid #9fe1cb;border-radius:16px;
+                 padding:4px 14px;font-size:13px;font-weight:600;color:#085041'>🏷 {domain}</span>
+    <span style='background:{mode_label[2]};border:1px solid {mode_label[1]};border-radius:16px;
+                 padding:4px 12px;font-size:11px;font-weight:600;color:{mode_label[1]}'>🔍 {mode_label[0]}</span>
+  </div>
+  <div style='margin-bottom:8px'>
+    <span style='font-size:12px;color:#555'>Confidence: <b style='color:{color}'>{pct}%</b>
+    &nbsp;{"→ intent filter" if pct>=55 else "→ domain filter" if pct>=25 else "→ no filter"}</span>
+    <div style='background:#e9ecef;border-radius:5px;height:7px;width:100%;max-width:280px;margin-top:4px'>
+      <div style='background:{color};width:{min(pct,100)}%;height:7px;border-radius:5px'></div>
     </div>
   </div>
-  <div style="margin-bottom:6px">
-    <div style="font-size:12px;color:#555;margin-bottom:3px">
-      Confidence: <b style="color:{conf_color}">{conf_pct}%</b>
-      {"&nbsp;— HIGH (intent filter)" if conf_pct>=70 else "&nbsp;— MEDIUM (domain filter)" if conf_pct>=40 else "&nbsp;— LOW (no filter)"}
-    </div>
-    <div style="background:#e9ecef;border-radius:6px;height:8px;width:100%;max-width:300px">
-      <div style="background:{conf_color};width:{conf_pct}%;height:8px;border-radius:6px"></div>
-    </div>
-  </div>
-  <details style="margin-top:8px">
-    <summary style="font-size:12px;color:#2d6a9f;cursor:pointer">Top-5 predictions</summary>
-    <table style="margin-top:6px;border-collapse:collapse">{top5_rows}</table>
+  <details style='margin-top:6px'>
+    <summary style='font-size:12px;color:#2d6a9f;cursor:pointer'>▸ Top-5 intent predictions</summary>
+    <table style='margin-top:6px;border-collapse:collapse'>{rows}</table>
+    <p style='font-size:11px;color:#999;margin:4px 0 0'>
+      Scores are relative margin values (LinearSVC). Higher = more confident.
+    </p>
   </details>
 </div>"""
-    return html
 
-def _docs_html(docs: List[Dict], filter_mode: str) -> str:
+def _docs_html(docs: List[Dict], mode: str) -> str:
     if not docs:
-        return "<p style='color:#888;padding:12px'>No documents retrieved.</p>"
-
+        return "<p style='color:#aaa;padding:10px'>No documents retrieved.</p>"
+    mode_desc = {
+        "intent":   "filtered to predicted intent",
+        "domain":   "filtered to predicted domain",
+        "none":     "full knowledge base search",
+        "fallback": "filter failed — full search",
+    }.get(mode, mode)
     cards = ""
     for i, d in enumerate(docs, 1):
-        score_pct = int(d['retrieval_score'] * 100)
-        score_color = "#27ae60" if score_pct >= 70 else "#f39c12" if score_pct >= 40 else "#e74c3c"
+        sc  = int(d['score'] * 100)
+        col = "#27ae60" if sc >= 70 else "#f39c12" if sc >= 40 else "#e74c3c"
+        res = d['resolution'][:220] + ('…' if len(d['resolution']) > 220 else '')
+        pol = f"<p style='font-size:11px;color:#999;margin:5px 0 0'><b>Policy:</b> {d['policy'][:110]}</p>" if d.get('policy') else ""
         cards += f"""
-<div style="border:1px solid #e2e8f0;border-left:4px solid #2d6a9f;border-radius:8px;
-            padding:12px 14px;margin:8px 0;background:#f8fafc;font-family:sans-serif">
-  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
-    <b style="color:#1e3a5f;font-size:14px">#{i} {d['title']}</b>
-    <span style="font-size:11px;background:#edf2f7;border-radius:10px;padding:2px 8px;color:{score_color}">
-      score: {d['retrieval_score']:.3f}
+<div style='border:1px solid #e2e8f0;border-left:4px solid #2d6a9f;border-radius:7px;
+            padding:10px 12px;margin:6px 0;background:#f8fafc'>
+  <div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:5px'>
+    <b style='color:#1e3a5f;font-size:13px'>#{i} {d["title"]}</b>
+    <span style='font-size:11px;background:#edf2f7;border-radius:8px;padding:2px 7px;color:{col}'>
+      {d["score"]:.3f}
     </span>
   </div>
-  <span style="background:#e1f5ee;color:#085041;border-radius:10px;
-               padding:2px 8px;font-size:11px">{d['domain']}</span>
-  <p style="margin:8px 0 0;font-size:13px;color:#4a5568;line-height:1.5">
-    {d['resolution'][:250]}{'...' if len(d['resolution'])>250 else ''}
-  </p>
-  {'<p style="margin:6px 0 0;font-size:11px;color:#718096"><b>Policy:</b> ' + d["policy"][:120] + '</p>' if d.get("policy") else ''}
+  <span style='background:#e1f5ee;color:#085041;border-radius:8px;padding:2px 8px;font-size:11px'>{d["domain"]}</span>
+  <p style='margin:6px 0 0;font-size:12px;color:#4a5568;line-height:1.5'>{res}</p>
+  {pol}
 </div>"""
+    return f"<div style='padding:6px'><p style='font-size:11px;color:#999;margin:0 0 4px'>Retrieval: <b>{mode_desc}</b> | {len(docs)} docs</p>{cards}</div>"
 
-    return f"""
-<div style="padding:8px">
-  <p style="font-size:12px;color:#718096;margin:0 0 6px">
-    Retrieved {len(docs)} doc(s) | Filter: <b>{filter_mode}</b>
-  </p>
-  {cards}
-</div>"""
+def _metrics_html(q: Dict, t: Dict, llm: Dict) -> str:
+    def col(v, lo=0.2, hi=0.4):
+        return "#27ae60" if v >= hi else "#f39c12" if v >= lo else "#e74c3c"
+    rows = [
+        ("ROUGE-L",      q['rougeL'],       col(q['rougeL'])),
+        ("ROUGE-1",      q['rouge1'],       col(q['rouge1'])),
+        ("Faithfulness", q['faithfulness'], col(q['faithfulness'])),
+        ("Word count",   q['words'],        "#555"),
+        ("Classify ms",  t['c'],            "#555"),
+        ("Retrieve ms",  t['r'],            "#555"),
+        ("LLM ms",       t['l'],            "#555"),
+        ("Total ms",     t['tot'],          "#27ae60"),
+    ]
+    trs = ""
+    for i,(label,val,color) in enumerate(rows):
+        bg = "background:#f7fafc;" if i%2==0 else ""
+        trs += (f"<tr style='{bg}'>"
+                f"<td style='padding:6px 8px;font-size:12px'>{label}</td>"
+                f"<td style='padding:6px 8px;text-align:right;font-weight:600;color:{color}'>{val}</td>"
+                f"</tr>")
+    return (f"<div style='padding:8px'>"
+            f"<table style='width:100%;border-collapse:collapse'>{trs}"
+            f"<tr><td style='padding:6px 8px;font-size:11px;color:#999'>Model</td>"
+            f"<td style='padding:6px 8px;text-align:right;font-size:11px;color:#999'>{llm.get('model','')}</td></tr>"
+            f"</table></div>")
 
-def _metrics_html(quality: Dict, timings: Dict, llm_result: Dict) -> str:
-    def color_val(v, low=0.2, high=0.4):
-        return "#27ae60" if v>=high else "#f39c12" if v>=low else "#e74c3c"
+def _backend_log(query, intent, domain, conf, mode, docs, llm, q, t,
+                 drift, drift_msg, warns, clarify) -> str:
+    ts    = datetime.now().strftime("%H:%M:%S")
+    lines = [
+        f"{'='*54}", f"  PIPELINE TRACE  [{ts}]", f"{'='*54}", "",
+        f"[INPUT GUARDRAILS]   PASSED", "",
+        f"[STEP 1 — ML CLASSIFICATION]",
+        f"  Query        : {query[:80]}",
+        f"  Intent       : {intent}",
+        f"  Domain       : {domain}",
+        f"  Confidence   : {conf:.4f}  ({int(conf*100)}%)",
+        f"  Filter route : {'intent filter (conf>=0.55)' if conf>=CONF_HIGH else 'domain filter (conf>=0.25)' if conf>=CONF_LOW else 'no filter (conf<0.25)'}",
+        f"  Classify ms  : {t['c']}",
+        "", f"[STEP 2 — RETRIEVAL]",
+        f"  Filter mode  : {mode}",
+        f"  Docs found   : {len(docs)}",
+    ]
+    for i,d in enumerate(docs,1):
+        lines.append(f"  Doc {i}: {d['title']} ({d['domain']}) score={d['score']:.3f}")
+    lines += [
+        f"  Retrieve ms  : {t['r']}", "",
+        f"[STEP 3 — LLM GENERATION]",
+        f"  Model        : {llm.get('model','')}",
+        f"  Output tokens: {llm.get('tokens',0)}",
+        f"  LLM ms       : {t['l']}",
+        f"  Success      : {llm.get('success',False)}", "",
+        f"[STEP 4 — OUTPUT GUARDRAILS]",
+        f"  ROUGE-L      : {q['rougeL']}",
+        f"  Faithfulness : {q['faithfulness']}",
+        f"  Words        : {q['words']}",
+    ]
+    if warns:
+        lines.append(f"  WARNINGS     : {' | '.join(warns)}")
+    lines += [
+        "", f"[CONTEXT & DRIFT]",
+        f"  Topic drift  : {'YES — ' + drift_msg if drift else 'No'}",
+        f"  Clarify mode : {'YES' if clarify else 'No'}",
+        "", f"  TOTAL MS     : {t['tot']}",
+        f"{'='*54}",
+    ]
+    return "\n".join(lines)
 
-    return f"""
-<div style="font-family:sans-serif;padding:10px">
-  <table style="width:100%;border-collapse:collapse">
-    <tr style="background:#f7fafc">
-      <th style="padding:8px;text-align:left;font-size:12px;color:#718096;border-bottom:1px solid #e2e8f0">Metric</th>
-      <th style="padding:8px;text-align:right;font-size:12px;color:#718096;border-bottom:1px solid #e2e8f0">Value</th>
-    </tr>
-    <tr>
-      <td style="padding:7px 8px;font-size:13px">ROUGE-L</td>
-      <td style="padding:7px 8px;text-align:right;font-weight:600;color:{color_val(quality['rougeL'])}">{quality['rougeL']}</td>
-    </tr>
-    <tr style="background:#f7fafc">
-      <td style="padding:7px 8px;font-size:13px">ROUGE-1</td>
-      <td style="padding:7px 8px;text-align:right;font-weight:600;color:{color_val(quality['rouge1'])}">{quality['rouge1']}</td>
-    </tr>
-    <tr>
-      <td style="padding:7px 8px;font-size:13px">Faithfulness</td>
-      <td style="padding:7px 8px;text-align:right;font-weight:600;color:{color_val(quality['faithfulness'])}">{quality['faithfulness']}</td>
-    </tr>
-    <tr style="background:#f7fafc">
-      <td style="padding:7px 8px;font-size:13px">Word count</td>
-      <td style="padding:7px 8px;text-align:right;color:#555">{quality['word_count']}</td>
-    </tr>
-    <tr>
-      <td style="padding:7px 8px;font-size:13px">Classify (ms)</td>
-      <td style="padding:7px 8px;text-align:right;color:#555">{timings['classify_ms']}</td>
-    </tr>
-    <tr style="background:#f7fafc">
-      <td style="padding:7px 8px;font-size:13px">Retrieve (ms)</td>
-      <td style="padding:7px 8px;text-align:right;color:#555">{timings['retrieve_ms']}</td>
-    </tr>
-    <tr>
-      <td style="padding:7px 8px;font-size:13px">LLM (ms)</td>
-      <td style="padding:7px 8px;text-align:right;color:#555">{timings['llm_ms']}</td>
-    </tr>
-    <tr style="background:#edf7f0">
-      <td style="padding:7px 8px;font-size:13px;font-weight:600">Total (ms)</td>
-      <td style="padding:7px 8px;text-align:right;font-weight:700;color:#27ae60">{timings['total_ms']}</td>
-    </tr>
-    <tr>
-      <td style="padding:7px 8px;font-size:12px;color:#718096">Model</td>
-      <td style="padding:7px 8px;text-align:right;font-size:12px;color:#718096">{llm_result.get('model','groq')}</td>
-    </tr>
-  </table>
-</div>"""
+# =============================================================================
+#  MAIN CHAT FUNCTION
+# =============================================================================
 
-def _build_eval_chart(backend_state: List[Dict]) -> Optional[plt.Figure]:
-    """Build a live evaluation chart from conversation history."""
-    turns = [s for s in backend_state if s.get('role') == 'assistant' and 'quality' in s]
-    if len(turns) < 2:
-        return None
+def chat(user_msg: str, history: List, state: List,
+         model_label: str, groq_key: str, gemini_key: str):
 
-    turn_nums    = list(range(1, len(turns) + 1))
-    rouge_vals   = [t['quality']['rougeL']       for t in turns]
-    faith_vals   = [t['quality']['faithfulness']  for t in turns]
-    conf_vals    = [t.get('confidence', 0)        for t in turns]
+    t0 = time.time()
 
-    fig, axes = plt.subplots(1, 3, figsize=(14, 3.5))
-    fig.patch.set_facecolor('#f8fafc')
+    # ── INPUT GUARDRAILS ──────────────────────────────────────────────────
+    safe, reject_msg = guardrail_input(user_msg)
+    if not safe:
+        bot = reject_msg
+        history.append({"role":"user","content":user_msg})
+        history.append({"role":"assistant","content":bot})
+        state.append({"role":"assistant","content":bot,"domain":"BLOCKED","intent":"BLOCKED"})
+        log = f"[GUARDRAIL BLOCKED]\n  Reason: {reject_msg}"
+        ih  = _intent_html("BLOCKED","N/A",0.0,"none",{})
+        dh  = "<p style='color:#e74c3c;padding:10px'>Query blocked by input guardrails.</p>"
+        mh  = "<p style='color:#aaa;padding:10px'>N/A</p>"
+        return "", history, state, log, ih, dh, mh
 
-    for ax, vals, label, color in zip(
-        axes,
-        [rouge_vals, faith_vals, conf_vals],
-        ['ROUGE-L', 'Faithfulness', 'Confidence'],
-        ['#4C72B0', '#55A868', '#DD8452']
-    ):
-        ax.plot(turn_nums, vals, 'o-', color=color, linewidth=2, markersize=6)
-        ax.fill_between(turn_nums, vals, alpha=0.15, color=color)
-        ax.set_title(label, fontweight='bold', fontsize=11)
-        ax.set_xlabel('Turn', fontsize=9)
-        ax.set_ylim(0, 1.05)
-        ax.set_xticks(turn_nums)
-        ax.grid(True, linestyle='--', alpha=0.4)
-        ax.set_facecolor('#f8fafc')
-        sns.despine(ax=ax)
+    clarify = is_clarification(user_msg)
 
-    plt.tight_layout()
-    return fig
+    # ── STEP 1: CLASSIFY ─────────────────────────────────────────────────
+    t1      = time.time()
+    intent, conf, top5 = predict_intent(user_msg)
+    domain  = KNOWLEDGE_BASE.get(intent, {}).get("domain", "General")
+    c_ms    = int((time.time()-t1)*1000)
 
-def clear_chat(history, backend_state):
-    return [], [], "", "", "", "", None
+    drift, drift_msg = detect_drift(domain, state)
 
-def use_sample(sample_text, history, backend_state):
-    """Inject a sample query into the input box."""
-    return sample_text
+    # ── STEP 2: RETRIEVE ─────────────────────────────────────────────────
+    t2      = time.time()
+    docs, mode = retrieve_docs(user_msg, intent, conf)
+    r_ms    = int((time.time()-t2)*1000)
+
+    # ── STEP 3: GENERATE ─────────────────────────────────────────────────
+    t3      = time.time()
+    llm     = generate(user_msg, docs, state, drift, drift_msg, clarify,
+                       model_label, groq_key, gemini_key)
+    l_ms    = int((time.time()-t3)*1000)
+    tot_ms  = int((time.time()-t0)*1000)
+
+    response = llm["response"]
+
+    # ── OUTPUT GUARDRAILS ─────────────────────────────────────────────────
+    response, warns = guardrail_output(response, docs)
+
+    # ── QUALITY ───────────────────────────────────────────────────────────
+    q = quality_metrics(response, docs)
+    t = {"c": c_ms, "r": r_ms, "l": l_ms, "tot": tot_ms}
+
+    # Build display response
+    display = response
+    if warns:
+        display += "\n\n" + "\n".join(warns)
+    if drift:
+        display = f"[Topic shift: {drift_msg}]\n\n{display}"
+
+    # Update history and state
+    history.append({"role":"user",      "content":user_msg})
+    history.append({"role":"assistant", "content":display})
+    state.append({"role":"user",      "content":user_msg,  "domain":domain,"intent":intent})
+    state.append({"role":"assistant", "content":display,   "domain":domain,"intent":intent,
+                  "confidence":conf, "mode":mode, "quality":q})
+    if len(state) > MAX_HISTORY*2+4:
+        state = state[-(MAX_HISTORY*2):]
+
+    # Build panels
+    log = _backend_log(user_msg,intent,domain,conf,mode,docs,llm,q,t,
+                       drift,drift_msg,warns,clarify)
+    ih  = _intent_html(intent, domain, conf, mode, top5)
+    dh  = _docs_html(docs, mode)
+    mh  = _metrics_html(q, t, llm)
+
+    print(log)
+    return "", history, state, log, ih, dh, mh
+
+def clear_all(history, state):
+    return [], [], "Cleared.", "<p style='color:#aaa;padding:10px'>Cleared.</p>", \
+           "<p style='color:#aaa;padding:10px'>Cleared.</p>", \
+           "<p style='color:#aaa;padding:10px'>Cleared.</p>"
 
 # =============================================================================
 #  GRADIO UI
 # =============================================================================
 
 SAMPLE_QUERIES = [
-    "My payment failed but money was deducted from my account",
+    "My payment failed but money was deducted",
     "I want to increase my credit card limit",
-    "My account is blocked and I can't log in",
     "How do I book a flight to Mumbai?",
     "Someone made an unauthorised transaction on my card",
+    "I couldn't understand your previous answer, explain simply",
     "What is my credit score and how to improve it?",
-    "I couldn't understand your previous answer, please explain simply",
+    "Tell me who will win the next election",     # OUT OF SCOPE — guardrail demo
     "How do I check my account balance?",
 ]
 
-THEME = gr.themes.Soft(
+# ── Theme: dark/light handled by Gradio's built-in theme toggle ──────────
+LIGHT_THEME = gr.themes.Soft(
     primary_hue="blue",
     secondary_hue="slate",
     font=[gr.themes.GoogleFont("Inter"), "sans-serif"],
 )
+DARK_THEME = gr.themes.Base(
+    primary_hue="blue",
+    secondary_hue="slate",
+    neutral_hue="slate",
+    font=[gr.themes.GoogleFont("Inter"), "sans-serif"],
+)
 
-with gr.Blocks(theme=THEME, title="AI Support Copilot") as demo:
+# We use a single Blocks build; Gradio 4.x supports js-based dark mode toggle
+with gr.Blocks(
+    theme=LIGHT_THEME,
+    title="AI Support Copilot",
+    css="""
+    .dark-mode { filter: invert(0.92) hue-rotate(180deg); }
+    .dark-mode img { filter: invert(1) hue-rotate(180deg); }
+    footer { display:none !important; }
+    .guardrail-note {
+        font-size:11px; color:#718096; margin-top:6px; padding:8px;
+        background:#f7fafc; border-radius:6px; border:1px solid #e2e8f0;
+    }
+    """
+) as demo:
 
-    # ── State ─────────────────────────────────────────────────────────────
-    backend_state = gr.State([])   # per-turn metadata
-    api_key_state = gr.State("")
+    state_var    = gr.State([])
+    dark_mode_js = """
+    () => {
+        const el = document.querySelector('.gradio-container');
+        el.classList.toggle('dark-mode');
+    }
+    """
 
-    # ── Header ────────────────────────────────────────────────────────────
-    gr.HTML("""
-    <div style="background:linear-gradient(135deg,#1e3a5f 0%,#2d6a9f 100%);
-                padding:20px 28px;border-radius:12px;margin-bottom:8px;color:white">
-      <h1 style="margin:0;font-size:26px;font-weight:600">
-        🤖 AI Customer Support Copilot
-      </h1>
-      <p style="margin:6px 0 0;font-size:14px;opacity:0.85">
-        Week 3 — ML Classification + RAG + Groq LLaMA | CLINC150 | With Guardrails & Context Memory
-      </p>
-    </div>
-    """)
-
+    # ── HEADER ────────────────────────────────────────────────────────────
     with gr.Row():
-        # ── LEFT COLUMN: Chat ──────────────────────────────────────────────
+        with gr.Column(scale=8):
+            gr.HTML("""
+            <div style="background:linear-gradient(135deg,#1e3a5f 0%,#2d6a9f 100%);
+                        padding:18px 24px;border-radius:10px;color:white">
+              <h1 style="margin:0;font-size:22px;font-weight:600">
+                🤖 AI Customer Support Copilot
+              </h1>
+              <p style="margin:5px 0 0;font-size:13px;opacity:0.85">
+                Week 3 · CLINC150 · LinearSVC + Chroma RAG + Groq/Gemini LLM · Guardrails
+              </p>
+            </div>""")
+        with gr.Column(scale=1, min_width=100):
+            theme_btn = gr.Button("🌙 Dark", size="sm", variant="secondary")
+            theme_btn.click(fn=None, js=dark_mode_js)
+
+    # ── SETTINGS ROW ─────────────────────────────────────────────────────
+    with gr.Row():
+        model_dd = gr.Dropdown(
+            choices=ALL_MODEL_LABELS,
+            value=DEFAULT_MODEL_LABEL,
+            label="LLM Model",
+            scale=3,
+        )
+        groq_key_box = gr.Textbox(
+            label="Groq API Key",
+            placeholder="gsk_... (console.groq.com — free)",
+            type="password",
+            scale=2,
+            value=os.environ.get("GROQ_API_KEY",""),
+        )
+        gemini_key_box = gr.Textbox(
+            label="Gemini API Key (optional)",
+            placeholder="AIza... (aistudio.google.com — free)",
+            type="password",
+            scale=2,
+            value=os.environ.get("GOOGLE_API_KEY",""),
+        )
+
+    # ── MAIN ROW: Chat + Debug ────────────────────────────────────────────
+    with gr.Row():
+
+        # LEFT — Chat
         with gr.Column(scale=3):
             chatbot = gr.Chatbot(
-                label="Customer Support Conversation",
-                height=480,
+                label="",
+                height=500,
                 bubble_full_width=False,
-                show_label=True,
-                avatar_images=("👤", "🤖"),
+                type="messages",
+                avatar_images=(USER_AVATAR, BOT_AVATAR),
+                show_label=False,
             )
-
             with gr.Row():
-                msg_box = gr.Textbox(
+                msg_box  = gr.Textbox(
                     placeholder="Type your customer support query here...",
                     label="",
                     lines=2,
@@ -871,135 +745,81 @@ with gr.Blocks(theme=THEME, title="AI Support Copilot") as demo:
                 )
                 send_btn = gr.Button("Send ▶", variant="primary", scale=1, min_width=80)
 
-            # Sample queries
-            gr.HTML("<p style='font-size:12px;color:#718096;margin:6px 0 4px'>Quick test queries:</p>")
+            gr.HTML("<p style='font-size:12px;color:#718096;margin:6px 0 3px'>Quick test queries:</p>")
             with gr.Row():
-                sample_btns = [
-                    gr.Button(label=q[:35]+"…" if len(q)>35 else q, size="sm")
-                    for q in SAMPLE_QUERIES[:4]
-                ]
+                sb1 = gr.Button(SAMPLE_QUERIES[0][:38], size="sm")
+                sb2 = gr.Button(SAMPLE_QUERIES[1][:38], size="sm")
+                sb3 = gr.Button(SAMPLE_QUERIES[2][:38], size="sm")
+                sb4 = gr.Button(SAMPLE_QUERIES[3][:38], size="sm")
             with gr.Row():
-                sample_btns2 = [
-                    gr.Button(label=q[:35]+"…" if len(q)>35 else q, size="sm")
-                    for q in SAMPLE_QUERIES[4:]
-                ]
+                sb5 = gr.Button(SAMPLE_QUERIES[4][:38], size="sm")
+                sb6 = gr.Button(SAMPLE_QUERIES[5][:38], size="sm")
+                sb7 = gr.Button("🚫 Out-of-scope demo", size="sm", variant="stop")
+                sb8 = gr.Button(SAMPLE_QUERIES[7][:38], size="sm")
 
             with gr.Row():
                 clear_btn = gr.Button("🗑 Clear Chat", size="sm", variant="secondary")
 
-            gr.HTML("""
-            <div style="font-size:11px;color:#718096;margin-top:6px;padding:8px;
-                        background:#f7fafc;border-radius:6px;border:1px solid #e2e8f0">
-              <b>Guardrails active:</b> Input validation · Prompt injection detection ·
-              Off-topic blocking · Output PII scan · Faithfulness check · Topic drift detection · Clarification mode
+            gr.HTML("""<div class='guardrail-note'>
+              <b>Active guardrails:</b> Input validation · Prompt injection · Off-topic blocking ·
+              PII output scan · Faithfulness check · Topic drift detection · Clarification mode
             </div>""")
 
-        # ── RIGHT COLUMN: Debug Panels ─────────────────────────────────────
+        # RIGHT — Debug panels
         with gr.Column(scale=2):
-            gr.HTML("<b style='font-size:14px;color:#1e3a5f'>Pipeline Debug</b>")
-
+            gr.HTML("<div style='font-size:13px;font-weight:600;color:#1e3a5f;margin-bottom:6px'>Pipeline Debug</div>")
             with gr.Accordion("🎯 Intent & Classification", open=True):
-                intent_panel = gr.HTML("<p style='color:#aaa;font-size:13px;padding:10px'>Send a query to see classification results.</p>")
-
+                intent_panel = gr.HTML(
+                    "<p style='color:#aaa;font-size:13px;padding:8px'>Send a query to see results.</p>")
             with gr.Accordion("📄 Retrieved Documents", open=True):
-                docs_panel = gr.HTML("<p style='color:#aaa;font-size:13px;padding:10px'>Retrieved docs will appear here.</p>")
-
+                docs_panel = gr.HTML(
+                    "<p style='color:#aaa;font-size:13px;padding:8px'>Docs appear here.</p>")
             with gr.Accordion("📊 Quality Metrics & Latency", open=False):
-                metrics_panel = gr.HTML("<p style='color:#aaa;font-size:13px;padding:10px'>Metrics appear after first query.</p>")
+                metrics_panel = gr.HTML(
+                    "<p style='color:#aaa;font-size:13px;padding:8px'>Metrics after first query.</p>")
 
-    # ── API Key Row ────────────────────────────────────────────────────────
-    with gr.Row():
-        api_key_box = gr.Textbox(
-            label="Groq API Key (paste here or set GROQ_API_KEY env var)",
-            placeholder="gsk_...",
-            type="password",
-            scale=3,
-        )
-        gr.HTML("""
-        <div style="padding:8px 0;font-size:12px;color:#555">
-          Get free key: <a href="https://console.groq.com" target="_blank">console.groq.com</a><br>
-          Free tier: 14,400 req/day · ~0.3s latency
-        </div>""")
-
-    # ── Backend Log ────────────────────────────────────────────────────────
-    with gr.Accordion("🖥 Backend Pipeline Log (full trace)", open=False):
+    # ── BACKEND LOG ───────────────────────────────────────────────────────
+    with gr.Accordion("🖥 Backend Pipeline Log", open=False):
         backend_log = gr.Code(
-            label="",
+            value="Backend log appears here after first query...",
             language="python",
-            lines=28,
-            value="Backend log will appear here after first query..."
+            lines=26,
+            label="",
         )
 
-    # ── Evaluation Charts ──────────────────────────────────────────────────
-    with gr.Accordion("📈 Live Evaluation Charts (ROUGE-L · Faithfulness · Confidence)", open=False):
-        eval_chart = gr.Plot(label="")
+    # ── EVENT WIRING ─────────────────────────────────────────────────────
+    OUTPUTS = [msg_box, chatbot, state_var, backend_log,
+               intent_panel, docs_panel, metrics_panel]
+    INPUTS  = [msg_box, chatbot, state_var, model_dd, groq_key_box, gemini_key_box]
 
-    # ── Week 2 Eval Summary ────────────────────────────────────────────────
-    with gr.Accordion("📋 Week 2 Retrieval Evaluation Summary", open=False):
-        try:
-            ret_summary = pd.read_csv(f"{ARTIFACTS_DIR}/retrieval_summary.csv")
-            gen_summary = pd.read_csv(f"{ARTIFACTS_DIR}/generation_eval_results.csv")
-            abl_summary = pd.read_csv(f"{ARTIFACTS_DIR}/ablation_results.csv")
-            eval_html = f"""
-<div style="font-family:sans-serif;padding:10px">
-  <h4 style="color:#1e3a5f;margin-top:0">Retrieval Evaluation (FAISS vs Chroma)</h4>
-  {ret_summary.to_html(index=False, border=0, classes='eval-table')}
-  <h4 style="color:#1e3a5f;margin-top:16px">Generation Quality (n=50 samples)</h4>
-  <table style="border-collapse:collapse">
-    <tr><td style="padding:4px 12px">ROUGE-L</td><td style="padding:4px 12px;font-weight:600;color:#2d6a9f">{gen_summary['rougeL'].mean():.4f}</td></tr>
-    <tr><td style="padding:4px 12px">Faithfulness</td><td style="padding:4px 12px;font-weight:600;color:#2d6a9f">{gen_summary['faithfulness'].mean():.4f}</td></tr>
-  </table>
-  <h4 style="color:#1e3a5f;margin-top:16px">Ablation: Intent Filter Contribution</h4>
-  <table style="border-collapse:collapse">
-    <tr><td style="padding:4px 12px">With filter</td><td style="padding:4px 12px;font-weight:600;color:#27ae60">{abl_summary['with_filter'].mean():.4f}</td></tr>
-    <tr><td style="padding:4px 12px">Without filter</td><td style="padding:4px 12px;font-weight:600;color:#e74c3c">{abl_summary['without_filter'].mean():.4f}</td></tr>
-  </table>
-</div>"""
-        except Exception as e:
-            eval_html = f"<p style='color:#888'>Run week2_rag_gemini.py first to generate eval CSVs. ({e})</p>"
-        gr.HTML(eval_html)
+    send_btn.click(fn=chat, inputs=INPUTS, outputs=OUTPUTS)
+    msg_box.submit(fn=chat, inputs=INPUTS, outputs=OUTPUTS)
 
-    # ── EVENT WIRING ───────────────────────────────────────────────────────
-    OUTPUTS = [msg_box, chatbot, backend_state, backend_log,
-               intent_panel, docs_panel, metrics_panel, eval_chart]
-
-    def send_wrapper(msg, history, bs, ak):
-        return chat(msg, history, bs, ak)
-
-    send_btn.click(
-        fn=send_wrapper,
-        inputs=[msg_box, chatbot, backend_state, api_key_box],
-        outputs=OUTPUTS,
-    )
-    msg_box.submit(
-        fn=send_wrapper,
-        inputs=[msg_box, chatbot, backend_state, api_key_box],
-        outputs=OUTPUTS,
-    )
-
-    # Sample query buttons
-    for btn, q in zip(sample_btns, SAMPLE_QUERIES[:4]):
-        btn.click(fn=lambda query=q: query, outputs=msg_box)
-    for btn, q in zip(sample_btns2, SAMPLE_QUERIES[4:]):
-        btn.click(fn=lambda query=q: query, outputs=msg_box)
+    # Sample buttons — direct text injection
+    sb1.click(fn=lambda: SAMPLE_QUERIES[0], outputs=msg_box)
+    sb2.click(fn=lambda: SAMPLE_QUERIES[1], outputs=msg_box)
+    sb3.click(fn=lambda: SAMPLE_QUERIES[2], outputs=msg_box)
+    sb4.click(fn=lambda: SAMPLE_QUERIES[3], outputs=msg_box)
+    sb5.click(fn=lambda: SAMPLE_QUERIES[4], outputs=msg_box)
+    sb6.click(fn=lambda: SAMPLE_QUERIES[5], outputs=msg_box)
+    sb7.click(fn=lambda: SAMPLE_QUERIES[6], outputs=msg_box)   # out-of-scope
+    sb8.click(fn=lambda: SAMPLE_QUERIES[7], outputs=msg_box)
 
     clear_btn.click(
-        fn=clear_chat,
-        inputs=[chatbot, backend_state],
-        outputs=[chatbot, backend_state, backend_log,
-                 intent_panel, docs_panel, metrics_panel, eval_chart]
+        fn=clear_all,
+        inputs=[chatbot, state_var],
+        outputs=[chatbot, state_var, backend_log,
+                 intent_panel, docs_panel, metrics_panel],
     )
-
-    api_key_box.change(fn=lambda k: k, inputs=api_key_box, outputs=api_key_state)
 
 # =============================================================================
 #  LAUNCH
 # =============================================================================
 if __name__ == "__main__":
     demo.launch(
-        share=True,           # gives public URL — works in Colab without tunneling
+        share=True,
         debug=True,
         show_error=True,
         server_port=7860,
-        inbrowser=False,      # False for Colab (no local browser)
+        inbrowser=False,
     )
